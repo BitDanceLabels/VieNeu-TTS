@@ -224,14 +224,16 @@ def get_model_status_message() -> str:
     )
 
 def restore_ui_state():
-    """Update UI components based on persistence"""
-    global model_loaded
+    """Update UI components based on persistence."""
+    global model_loaded, tts
     msg = get_model_status_message()
+    voice_update = get_preset_voice_dropdown_update() if model_loaded and tts is not None else gr.update()
     return (
-        msg, 
+        msg,
         gr.update(interactive=model_loaded), # btn_generate
         gr.update(interactive=model_loaded), # btn_generate_conv
-        gr.update(interactive=False)         # btn_stop
+        gr.update(interactive=False),        # btn_stop
+        voice_update                         # voice_select
     )
 
 def should_use_lmdeploy(backbone_choice: str, device_choice: str) -> bool:
@@ -688,11 +690,11 @@ def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
         has_voices = len(voices) > 0
         
         if has_voices:
-            default_v = tts._default_voice
+            default_v = getattr(tts, '_default_voice', None)
             
             # Helper to get values list
             is_tuple = (len(voices) > 0 and isinstance(voices[0], tuple))
-            voice_values = [v[1] for v in voices] if is_tuple else voices
+            voice_values = [_voice_value(v) for v in voices]
             
             if not default_v and voice_values:
                  default_v = voice_values[0]
@@ -704,6 +706,13 @@ def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
                     voices.append((default_v, default_v))
                 else:
                     voices.append(default_v)
+                voice_values.append(default_v)
+
+            if default_v:
+                try:
+                    tts._default_voice = default_v
+                except Exception:
+                    pass
             
             # Sort voices by name/label for better UX
             if is_tuple:
@@ -724,7 +733,7 @@ def load_model(backbone_choice: str, codec_choice: str, device_choice: str,
                     return val.strip().lower() == "true"
                 return bool(val)
 
-            CONV_VOICES_CACHE = [v for v in voices if _check_podcast(v[1])]
+            CONV_VOICES_CACHE = [v for v in voices if _check_podcast(_voice_value(v))]
             
             slot_dd_update = gr.update(choices=CONV_VOICES_CACHE)
             
@@ -817,6 +826,48 @@ def resolve_voice_id(v_id: str) -> str:
             
     return v_id
 
+
+def _voice_value(item):
+    """Return the internal voice ID from either a Gradio (label, value) choice or a string choice."""
+    if isinstance(item, (list, tuple)) and len(item) >= 2:
+        return item[1]
+    return item
+
+
+def _refresh_preset_voice_cache():
+    """Populate preset voice cache from the loaded SDK instance when the UI was refreshed."""
+    global PRESET_VOICES_CACHE
+    if PRESET_VOICES_CACHE or tts is None:
+        return PRESET_VOICES_CACHE
+    try:
+        PRESET_VOICES_CACHE = tts.list_preset_voices() or []
+    except Exception:
+        PRESET_VOICES_CACHE = []
+    return PRESET_VOICES_CACHE
+
+
+def get_default_preset_voice_choice():
+    """Choose a stable default preset when Gradio sends an empty dropdown value."""
+    if tts is None:
+        return ""
+    voices = _refresh_preset_voice_cache()
+    voice_values = [_voice_value(v) for v in voices]
+    default_v = getattr(tts, '_default_voice', None)
+    if default_v and default_v in voice_values:
+        return default_v
+    if voice_values:
+        return voice_values[0]
+    return default_v or ""
+
+
+def get_preset_voice_dropdown_update():
+    """Restore the preset dropdown after page reloads while the model stays loaded server-side."""
+    voices = _refresh_preset_voice_cache()
+    default_v = get_default_preset_voice_choice()
+    if voices and default_v:
+        return gr.update(choices=voices, value=default_v, interactive=True)
+    return gr.update()
+
 # --- 2. DATA & HELPERS ---
 
 # Phong cách đọc (style) đã bỏ trên v3 Turbo: style nằm sẵn trong reference
@@ -858,6 +909,8 @@ def synthesize_speech(text: str, voice_choice: str, custom_audio, custom_text: s
         v_id = None
 
         if mode_tab == "preset_mode":
+            if not voice_choice:
+                voice_choice = get_default_preset_voice_choice()
             if not voice_choice:
                 raise ValueError("Vui lòng chọn giọng mẫu.")
             if "⚠️" in voice_choice:
@@ -2349,7 +2402,7 @@ with gr.Blocks(theme=theme, css=css, title="VieNeu-TTS", head=head_html) as demo
         # Persistence: Restore UI state on load
         demo.load(
             fn=restore_ui_state,
-            outputs=[model_status, btn_generate, btn_generate_conv, btn_stop]
+            outputs=[model_status, btn_generate, btn_generate_conv, btn_stop, voice_select]
         )
 
 def main():
