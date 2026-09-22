@@ -63,8 +63,9 @@ from typing import Any, Iterator, Optional
 import numpy as np
 import uvicorn
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
-from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, Field
+from pathlib import Path
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from pydantic import BaseModel, Field, model_validator
 
 from vieneu import Vieneu
 
@@ -73,6 +74,8 @@ log = logging.getLogger("vieneu.api")
 
 SAMPLE_RATE = 48_000
 MODEL_ID = "vieneu-v3-turbo"
+ROOT_DIR = Path(__file__).resolve().parents[1]
+CLIENT_HTML_PATH = ROOT_DIR / "client" / "client.html"
 RATES = (48_000, 24_000, 16_000, 8_000)
 
 
@@ -228,8 +231,20 @@ class _Resampler:
 
 class SpeechRequest(BaseModel):
     model: str = MODEL_ID
-    input: str = Field(min_length=1, max_length=20_000)
+    input: Optional[str] = Field(default=None, min_length=1, max_length=20_000)
+    text: Optional[str] = None
     voice: Optional[str] = None
+    voice_id: Optional[str] = None
+
+    @model_validator(mode="before")
+    @classmethod
+    def normalize_fields(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            if not data.get("input") and data.get("text"):
+                data["input"] = data["text"]
+            if not data.get("voice") and data.get("voice_id"):
+                data["voice"] = data["voice_id"]
+        return data
     response_format: str = "wav"
     stream_format: str = "audio"
     speed: Optional[float] = None
@@ -296,6 +311,8 @@ def _sse_body(chunks: Iterator[np.ndarray], fmt: str, rate: int) -> Iterator[byt
 
 @app.post("/v1/audio/speech", dependencies=[Depends(_auth)])
 def speech(req: SpeechRequest):
+    if not req.input:
+        raise HTTPException(400, "input (or text) is required and cannot be empty")
     eng = engine()
     fmt = req.response_format.lower()
     if fmt not in ("pcm", "wav"):
@@ -336,6 +353,39 @@ def models():
 @app.get("/v1/voices", dependencies=[Depends(_auth)])
 def voices():
     return {"object": "list", "data": engine().voices()}
+
+
+@app.get("/")
+def ui():
+    if CLIENT_HTML_PATH.exists():
+        return FileResponse(CLIENT_HTML_PATH, media_type="text/html")
+    return JSONResponse({"message": "VieNeu-TTS v3 Turbo API Server", "docs": "/docs"})
+
+
+@app.get("/voices")
+def legacy_voices():
+    vs = engine().voices()
+    return [{"id": v.get("id", ""), "name": v.get("name", "")} for v in vs]
+
+
+class StreamReq(BaseModel):
+    text: str
+    voice_id: Optional[str] = None
+    voice: Optional[str] = None
+
+
+@app.get("/stream")
+def stream_get(text: str, voice_id: Optional[str] = None, voice: Optional[str] = None):
+    chosen_voice = voice or voice_id
+    req = SpeechRequest(input=text, voice=chosen_voice, response_format="wav", stream_format="audio")
+    return speech(req)
+
+
+@app.post("/stream")
+def stream_post(req: StreamReq):
+    chosen_voice = req.voice or req.voice_id
+    speech_req = SpeechRequest(input=req.text, voice=chosen_voice, response_format="wav", stream_format="audio")
+    return speech(speech_req)
 
 
 # A voice name is a label: letters/digits (any script), spaces, dots, dashes,
