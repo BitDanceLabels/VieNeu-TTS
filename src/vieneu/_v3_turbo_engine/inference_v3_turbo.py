@@ -21,6 +21,7 @@ Credits
 from __future__ import annotations
 import math
 import threading
+from pathlib import Path
 import time
 from typing import Generator, List, Optional, Tuple, Union
 import numpy as np
@@ -30,6 +31,9 @@ from .configuration_v3_turbo import VieNeuV3TurboConfig
 from .hub_load_v3_turbo import load_v3_turbo_checkpoint
 from .modeling_v3_turbo import VieNeuV3TurboForTTS, _sample_token
 from .rep_history import DEFAULT_REP_WINDOW, RepetitionHistory
+from vieneu_utils.core_utils import (BABBLE_MAX_RETRIES, CODEC_SAMPLES_PER_FRAME, babble_suspect,
+                                     babble_prefer, babble_log_line)
+import logging
 
 # Reference clips longer than this are trimmed before enrollment.
 _MAX_REF_SECONDS = 8.0
@@ -93,7 +97,8 @@ class VieNeuTTSv3Turbo:
                 try:
                     from huggingface_hub import hf_hub_download
                     from .onnx_denoiser import OnnxDenoiser
-                    dn_path = hf_hub_download(checkpoint_path, denoiser_filename)
+                    _local = Path(checkpoint_path) / denoiser_filename
+                    dn_path = str(_local) if _local.is_file() else hf_hub_download(checkpoint_path, denoiser_filename)
                     self.denoiser = OnnxDenoiser(dn_path)
                 except Exception:
                     self.denoiser = None
@@ -172,8 +177,27 @@ class VieNeuTTSv3Turbo:
         if frame_cap:
             from vieneu_utils.core_utils import max_expected_frames
             max_new_frames = min(max_new_frames, max_expected_frames(phonemes))
-        codes = self._generate_codes(phonemes, None, ref_codes, speaker_emb, style, use_ref_codes, temperature, top_k, top_p, max_new_frames, repetition_penalty, repetition_window)
-        return self._decode_codes(codes)
+        gen = lambda: self._generate_codes(phonemes, None, ref_codes, speaker_emb, style, use_ref_codes, temperature, top_k, top_p, max_new_frames, repetition_penalty, repetition_window)
+        codes = gen()
+        wav = self._decode_codes(codes)
+        # Babble guard: chunk rất ngắn "nói thêm" sau stop token trượt -> sinh lại
+        # (xem vieneu_utils.core_utils.babble_suspect). Nằm ở tầng engine nên mọi
+        # lối vào (SDK, Gradio, server) đều được che, không chỉ VieNeu.infer().
+        retries = int(getattr(self, "babble_retries", BABBLE_MAX_RETRIES))
+        if retries > 0 and frame_cap:
+            sr = int(getattr(self, "sample_rate", 48_000))
+            best = babble_suspect(wav, sr, phonemes, max_new_frames, len(codes))
+            tries = 0
+            while best[0] and tries < retries:
+                c2 = gen()
+                w2 = self._decode_codes(c2)
+                cand = babble_suspect(w2, sr, phonemes, max_new_frames, len(c2))
+                if babble_prefer(cand, best):
+                    codes, wav, best = c2, w2, cand
+                tries += 1
+            if tries:
+                logging.getLogger("Vieneu.V3Turbo").info("🔁 " + babble_log_line(best, tries, max_new_frames))
+        return wav
 
     def infer_stream(self, phonemes: Optional[str]=None, text: Optional[str]=None, ref_codes: Optional[np.ndarray]=None, speaker_emb: Optional[np.ndarray]=None, style=None, use_ref_codes: bool=True, temperature: float=0.8, top_k: int=25, top_p: float=0.95, max_new_frames: int=300, chunk_frames: int=25, repetition_penalty: float=1.2, repetition_window: int=DEFAULT_REP_WINDOW, frame_cap: bool=True) -> Generator[np.ndarray, None, None]:
         """Like :meth:`infer` but yields the waveform in chunks for low latency."""
@@ -311,8 +335,18 @@ class VieNeuTTSv3Turbo:
     def _load_mono(self, ref_audio: Union[str, "torch.Tensor"], sr: Optional[int]) -> Tuple[torch.Tensor, int]:
         """Return ``(wav (1, T) float32, sr)`` from a path or an in-memory waveform."""
         if isinstance(ref_audio, (str, bytes)) or hasattr(ref_audio, "__fspath__"):
-            import torchaudio
-            wav, sr = torchaudio.load(str(ref_audio))
+            # soundfile is a base dependency; torchaudio is NOT part of the [cuda]
+            # extra, so it is only a fallback for formats libsndfile cannot read.
+            try:
+                import soundfile as sf
+                data, sr = sf.read(str(ref_audio), dtype="float32", always_2d=True)   # (T, C)
+                wav = torch.from_numpy(np.ascontiguousarray(data.T))                    # (C, T)
+            except Exception as e:  # noqa: BLE001
+                try:
+                    import torchaudio
+                except ImportError:
+                    raise RuntimeError(f"Không đọc được audio mẫu '{ref_audio}': {e}") from e
+                wav, sr = torchaudio.load(str(ref_audio))
         else:
             wav = torch.as_tensor(ref_audio, dtype=torch.float32)
             if sr is None:
@@ -323,16 +357,38 @@ class VieNeuTTSv3Turbo:
             wav = wav.mean(0, keepdim=True)
         return wav.float(), sr
 
+    @staticmethod
+    def _resample(wav: torch.Tensor, sr: int, target: int) -> torch.Tensor:
+        """(C, T) → (C, T') via soxr (base dependency); torchaudio only as a fallback."""
+        try:
+            import soxr
+            out = soxr.resample(wav.cpu().numpy().T, sr, target)         # (T, C) in / out
+            return torch.from_numpy(np.ascontiguousarray(out.T.astype(np.float32)))
+        except ImportError:
+            import torchaudio
+            return torchaudio.functional.resample(wav, sr, target)
+
     def _encode_ref_wav(self, wav: torch.Tensor, sr: int) -> np.ndarray:
-        import torchaudio
+        """Waveform ``(ch, n)`` → MOSS codes ``(T, n_vq)``, ``T = n_padded / 3840``.
+
+        The clip is zero-padded to a whole number of codec frames first: fed an
+        odd tail, the codec pads it itself and that frame always comes out as
+        codebook-0 = 455, an audible blip rather than silence (issue #198). With
+        real zeros the last frame encodes the actual tail (+ silence).
+        """
         if sr != self.SAMPLE_RATE:
-            wav = torchaudio.functional.resample(wav, sr, self.SAMPLE_RATE)
+            wav = self._resample(wav, sr, self.SAMPLE_RATE)
+        n = wav.shape[-1]
+        if n % CODEC_SAMPLES_PER_FRAME:
+            wav = torch.nn.functional.pad(wav, (0, CODEC_SAMPLES_PER_FRAME - n % CODEC_SAMPLES_PER_FRAME))
+        n_frames = wav.shape[-1] // CODEC_SAMPLES_PER_FRAME
         n_ch = int(getattr(self.audio_tokenizer.config, 'number_channels', 2))
         wav = wav.repeat(n_ch, 1) if wav.shape[0] == 1 else wav[:n_ch]
         wav = wav.unsqueeze(0).to(self.device)
         with torch.no_grad():
             enc = self.audio_tokenizer.encode(wav, return_dict=True)
-        return self._moss_codes_to_Tnq(enc.audio_codes, self.config.n_vq).cpu().numpy()
+        codes = self._moss_codes_to_Tnq(enc.audio_codes, self.config.n_vq).cpu().numpy()
+        return codes[:n_frames]
 
     def _encode_ref(self, ref_audio_path: str) -> np.ndarray:
         """Encode a reference wav into MOSS voice codes of shape ``(T, n_vq)``."""
