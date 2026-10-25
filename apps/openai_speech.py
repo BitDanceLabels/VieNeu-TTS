@@ -27,7 +27,7 @@ Request body (OpenAI fields + a few extras, all optional but ``input``):
     stream_format    "audio" (default: raw chunked body) | "sse" (Server-Sent
                      Events: {"type":"speech.audio.delta","audio":"<base64>"} ...
                      {"type":"speech.audio.done","usage":{...}})
-    speed            accepted for compatibility, ignored (header X-VieNeu-Ignored)
+    speed            tốc độ đọc 0.5–2.0, giữ cao độ (ffmpeg atempo, phát liền); mặc định VIENEU_DEFAULT_SPEED (1.0)
     sample_rate      48000 (native) | 24000 (OpenAI's pcm rate) | 16000 | 8000 —
                      resampled on the fly (soxr), per chunk, no extra latency
     temperature, top_k, top_p, repetition_penalty, max_chars   sampling extras
@@ -53,13 +53,17 @@ import json
 import logging
 import os
 import re
+import select
 import struct
+import subprocess
 import threading
 import time
 import uuid
 import wave
 from typing import Any, Iterator, Optional
 
+import anyio
+import anyio.to_thread
 import numpy as np
 import uvicorn
 from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Request, UploadFile
@@ -227,6 +231,82 @@ class _Resampler:
         return self._rs.resample_chunk(np.asarray(x, dtype=np.float32), last=last)
 
 
+# ── tốc độ đọc (Bumbee 26/10: "đọc hơi buồn ngủ … tăng tốc đọc lên 1 xí") ─────
+DEFAULT_SPEED = float(os.environ.get("VIENEU_DEFAULT_SPEED", "1.0"))
+
+
+def _speed_of(req_speed: Optional[float]) -> float:
+    s = DEFAULT_SPEED if req_speed is None else float(req_speed)
+    return max(0.5, min(2.0, s))
+
+
+def _tempo(chunks: Iterator[np.ndarray], rate: int, speed: float) -> Iterator[np.ndarray]:
+    """Đổi nhịp đọc giữ cao độ bằng ffmpeg atempo, vẫn phát tới đâu nghe tới đó.
+    Không luồng phụ: ghi 1 khối vào ffmpeg rồi lấy phần đã ra; generator bị đóng → giết ffmpeg + đóng chunks (trả slot)."""
+    if abs(speed - 1.0) < 0.01:
+        yield from chunks
+        return
+    # không dò định dạng + không gom đệm: âm đầu ra ngay (~0,1 s) thay vì chờ hết câu
+    p = subprocess.Popen(["ffmpeg", "-loglevel", "error", "-probesize", "32", "-analyzeduration", "0", "-fflags", "+nobuffer",
+                          "-f", "f32le", "-ar", str(rate), "-ac", "1", "-i", "pipe:0",
+                          "-af", f"atempo={speed:.3f}", "-flush_packets", "1", "-f", "f32le", "-ar", str(rate), "-ac", "1", "pipe:1"],
+                         stdin=subprocess.PIPE, stdout=subprocess.PIPE, bufsize=0)
+    fd = p.stdout.fileno()
+    rest = b""
+
+    def drain(wait: float) -> bytes:
+        got = b""
+        while select.select([fd], [], [], wait)[0]:
+            b = os.read(fd, 1 << 16)
+            if not b:
+                break
+            got += b
+            wait = 0.0
+        return got
+
+    def out(b: bytes):
+        nonlocal rest
+        b = rest + b
+        n = len(b) // 4 * 4
+        rest = b[n:]
+        return np.frombuffer(b[:n], dtype=np.float32) if n else None
+
+    try:
+        for c in chunks:
+            p.stdin.write(np.asarray(c, dtype=np.float32).tobytes())
+            a = out(drain(0.03))
+            if a is not None:
+                yield a
+        p.stdin.close()
+        while True:
+            b = os.read(fd, 1 << 16)
+            if not b:
+                break
+            a = out(b)
+            if a is not None:
+                yield a
+    finally:
+        chunks.close()  # type: ignore[attr-defined]  — chạy finally của _speech_chunks (trả slot)
+        if p.poll() is None:
+            p.kill()
+        p.wait()
+
+
+async def _guarded(it: Iterator[bytes]):
+    """Bọc body đồng bộ: khách ngắt giữa chừng (Bé Đen bị cắt lời) thì vẫn đóng generator → trả slot.
+    Trước đây generator treo lửng khi khách ngắt, mỗi lần ngắt mất 1 slot tới khi server khởi động lại."""
+    end = object()
+    try:
+        while True:
+            b = await anyio.to_thread.run_sync(next, it, end)  # không huỷ giữa chừng: next() xong rồi mới nhận huỷ
+            if b is end:
+                break
+            yield b
+    finally:
+        with anyio.CancelScope(shield=True):
+            await anyio.to_thread.run_sync(it.close)
+
+
 # ── /v1/audio/speech ─────────────────────────────────────────────────────────
 
 class SpeechRequest(BaseModel):
@@ -325,16 +405,18 @@ def speech(req: SpeechRequest):
         raise HTTPException(400, f"unknown voice '{req.voice}'; see GET /v1/voices")
     rid = f"spk-{uuid.uuid4().hex[:8]}"
     eng.acquire()   # 429 if the server is full; released when the stream ends
-    chunks = _speech_chunks(eng, req, rid)
+    speed = _speed_of(req.speed)
+    chunks = _tempo(_speech_chunks(eng, req, rid), req.sample_rate, speed)
     headers = {"X-Request-Id": rid, "X-Sample-Rate": str(req.sample_rate), "Cache-Control": "no-store"}
-    ignored = [k for k in ("speed", "instructions") if getattr(req, k) is not None]
+    headers["X-VieNeu-Speed"] = f"{speed:.2f}"
+    ignored = [k for k in ("instructions",) if getattr(req, k) is not None]
     if ignored:
         headers["X-VieNeu-Ignored"] = ",".join(ignored)
     if req.stream_format == "sse":
-        return StreamingResponse(_sse_body(chunks, fmt, req.sample_rate),
+        return StreamingResponse(_guarded(_sse_body(chunks, fmt, req.sample_rate)),
                                  media_type="text/event-stream", headers=headers)
     media = "audio/wav" if fmt == "wav" else "audio/pcm"
-    return StreamingResponse(_audio_body(chunks, fmt, req.sample_rate), media_type=media, headers=headers)
+    return StreamingResponse(_guarded(_audio_body(chunks, fmt, req.sample_rate)), media_type=media, headers=headers)
 
 
 # ── discovery ────────────────────────────────────────────────────────────────
@@ -372,19 +454,20 @@ class StreamReq(BaseModel):
     text: str
     voice_id: Optional[str] = None
     voice: Optional[str] = None
+    speed: Optional[float] = None
 
 
 @app.get("/stream")
-def stream_get(text: str, voice_id: Optional[str] = None, voice: Optional[str] = None):
+def stream_get(text: str, voice_id: Optional[str] = None, voice: Optional[str] = None, speed: Optional[float] = None):
     chosen_voice = voice or voice_id
-    req = SpeechRequest(input=text, voice=chosen_voice, response_format="wav", stream_format="audio")
+    req = SpeechRequest(input=text, voice=chosen_voice, response_format="wav", stream_format="audio", speed=speed)
     return speech(req)
 
 
 @app.post("/stream")
 def stream_post(req: StreamReq):
     chosen_voice = req.voice or req.voice_id
-    speech_req = SpeechRequest(input=req.text, voice=chosen_voice, response_format="wav", stream_format="audio")
+    speech_req = SpeechRequest(input=req.text, voice=chosen_voice, response_format="wav", stream_format="audio", speed=req.speed)
     return speech(speech_req)
 
 
